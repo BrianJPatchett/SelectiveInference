@@ -1,0 +1,176 @@
+## =========================================================
+## Experiment 1 (final): One-step pipeline
+## Select by clustering (on S) → Freeze → Test on T (Welch t)
+## =========================================================
+
+## ---- libraries ----
+suppressPackageStartupMessages({
+  library(future)
+  library(future.apply)
+  library(ggplot2)
+})
+
+## ---- utilities: seed-safe parallel runner ----
+exp1_run <- function(worker,
+                     R = 500,
+                     seed = 1,
+                     workers = max(1, parallelly::availableCores() - 1),
+                     ...) {
+  # parallel-safe RNG + plan (scoped)
+  set.seed(seed)
+  RNGkind("L'Ecuyer-CMRG")
+  oplan <- future::plan(multisession, workers = workers)
+  on.exit(future::plan(oplan), add = TRUE)
+  options(future.rng.onMisuse = "ignore")
+
+  # never crash an iteration; annotate reason on failure
+  safe_worker <- function(i, ...) {
+    tryCatch({
+      p <- worker(i, ...)
+      if (!is.numeric(p) || length(p) != 1L || !is.finite(p)) stop("nonfinite_p")
+      list(ok = TRUE, p_se1 = as.numeric(p), reason = NA_character_)
+    }, error = function(e) {
+      list(ok = FALSE, p_se1 = NA_real_, reason = conditionMessage(e))
+    })
+  }
+
+  res <- future_lapply(seq_len(R), function(i) safe_worker(i, ...),
+                       future.seed = TRUE)
+  df <- do.call(rbind, lapply(res, as.data.frame))
+
+  # quick console summary
+  na_rate <- mean(is.na(df$p_se1))
+  pr_sig  <- mean(df$p_se1 < 0.05, na.rm = TRUE)
+  med_p   <- median(df$p_se1, na.rm = TRUE)
+  message(sprintf("R=%d | NA rate=%.1f%% | Pr(p<0.05)=%.3f | median p=%.3f",
+                  R, 100*na_rate, pr_sig, med_p))
+
+  df
+}
+
+## ---- helpers ----
+# Fast assignment of rows of X to two frozen centers (squared Euclidean)
+assign_to_two <- function(X, centers) {
+  d1 <- rowSums((X - matrix(centers[1,], nrow = nrow(X), ncol = ncol(X), byrow = TRUE))^2)
+  d2 <- rowSums((X - matrix(centers[2,], nrow = nrow(X), ncol = ncol(X), byrow = TRUE))^2)
+  ifelse(d1 <= d2, 1L, 2L)
+}
+
+# One-step worker: k-means on S (selection), assign T, Welch test on y in T
+worker_cluster_ttest <- function(i, X, y, train_frac = 0.5, k = 2, nstart = 10) {
+  stopifnot(nrow(X) == length(y), k == 2)
+  n   <- nrow(X)
+  idx <- sample.int(n, n)
+  nS  <- floor(train_frac * n)
+  S   <- idx[seq_len(nS)]
+  T   <- idx[-seq_len(nS)]
+
+  km  <- stats::kmeans(X[S, , drop = FALSE], centers = k, nstart = nstart)
+  gT  <- assign_to_two(X[T, , drop = FALSE], km$centers)
+
+  y1 <- y[T][gT == 1L]; y2 <- y[T][gT == 2L]
+  y1 <- y1[is.finite(y1)]; y2 <- y2[is.finite(y2)]
+  if (length(y1) < 2L || length(y2) < 2L) stop("too_few_obs_in_T_groups")
+  stats::t.test(y1, y2, var.equal = FALSE)$p.value
+}
+
+# Same worker but allow injection of delta on one T cluster to study power
+worker_cluster_ttest_with_delta <- function(i, X, y, delta = 0,
+                                            train_frac = 0.5, k = 2, nstart = 10) {
+  n   <- nrow(X)
+  idx <- sample.int(n, n)
+  nS  <- floor(train_frac * n)
+  S   <- idx[seq_len(nS)]
+  T   <- idx[-seq_len(nS)]
+
+  km  <- stats::kmeans(X[S, , drop = FALSE], centers = k, nstart = nstart)
+  gT  <- assign_to_two(X[T, , drop = FALSE], km$centers)
+
+  yT <- y[T]
+  yT[gT == 1L] <- yT[gT == 1L] + delta  # inject effect on cluster 1
+
+  y1 <- yT[gT == 1L]; y2 <- yT[gT == 2L]
+  y1 <- y1[is.finite(y1)]; y2 <- y2[is.finite(y2)]
+  if (length(y1) < 2L || length(y2) < 2L) stop("too_few_obs_in_T_groups")
+  stats::t.test(y1, y2, var.equal = FALSE)$p.value
+}
+
+## ---- plotting helpers (no file export by default) ----
+plot_p_hist <- function(df, title = "p-value histogram") {
+  ggplot(df, aes(p_se1)) +
+    geom_histogram(bins = 20, boundary = 0) +
+    coord_cartesian(xlim = c(0, 1)) +
+    labs(x = "p-value", y = "Count", title = title)
+}
+plot_p_qq <- function(df, title = "QQ plot vs Uniform(0,1)") {
+  p <- sort(df$p_se1[is.finite(df$p_se1)])
+  n <- length(p); if (n < 5) return(ggplot() + ggtitle("Too few p-values"))
+  u <- (seq_along(p) - 0.5) / n
+  qq <- data.frame(u = u, p = p)
+  ggplot(qq, aes(u, p)) +
+    geom_point(alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    labs(x = "Uniform quantiles", y = "Empirical quantiles", title = title)
+}
+plot_p_ecdf <- function(df, title = "ECDF of p-values") {
+  ggplot(df, aes(p_se1)) +
+    stat_ecdf(geom = "step") +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    labs(x = "p-value", y = "ECDF", title = title)
+}
+plot_power <- function(power_df) {
+  ggplot(power_df, aes(delta, power)) +
+    geom_line() + geom_point() +
+    ylim(0, 1) +
+    labs(x = "Effect size (delta)", y = "Power (Pr(p<0.05))", title = "Power curve")
+}
+
+## ---- demo data (synthetic) ----
+# X has a 2D signal-ish subspace + noise; y is independent (null)
+set.seed(2)
+n <- 600; p <- 5
+X <- cbind(
+  matrix(rnorm(n*2), n, 2),
+  matrix(rnorm(n*(p-2)), n, p-2)
+)
+colnames(X) <- paste0("x", seq_len(p))
+y_null <- rnorm(n)
+
+## ======================
+## A) Null calibration
+## ======================
+null_df <- exp1_run(
+  worker = function(i) worker_cluster_ttest(i, X = X, y = y_null, train_frac = 0.5, k = 2),
+  R = 500, seed = 11
+)
+
+print(head(null_df, 6))
+print(plot_p_hist(null_df, "Null: p-value histogram"))
+print(plot_p_qq(null_df,  "Null: QQ plot vs Uniform(0,1)"))
+print(plot_p_ecdf(null_df,"Null: ECDF of p-values"))
+
+## ======================
+## B) Power study
+## ======================
+deltas <- seq(0, 1.0, by = 0.1)
+power_df <- do.call(rbind, lapply(deltas, function(d) {
+  df <- exp1_run(
+    worker = function(i) worker_cluster_ttest_with_delta(i, X = X, y = y_null, delta = d),
+    R = 400, seed = 21 + as.integer(d*100)
+  )
+  data.frame(delta = d, power = mean(df$p_se1 < 0.05, na.rm = TRUE))
+}))
+print(power_df)
+print(plot_power(power_df))
+
+## ======================
+## C) Swap in your data
+## ======================
+# Replace this block when moving off the synthetic demo:
+#   X_data <- as.matrix(your_df[, c("feat1","feat2","feat3", ...)])
+#   y_data <- your_df$outcome_numeric
+#   null_res <- exp1_run(function(i) worker_cluster_ttest(i, X = X_data, y = y_data), R = 500)
+#   print(plot_p_hist(null_res, "Your data: p-value histogram"))
+#   # optional power probe (structure-dependent, not causal):
+#   pow_res <- exp1_run(function(i) worker_cluster_ttest_with_delta(i, X = X_data, y = y_data, delta = 0.3), R = 400)
+#   mean(pow_res$p_se1 < 0.05, na.rm = TRUE)
