@@ -1,0 +1,91 @@
+## =========================
+## Experiment 2: split trade-off
+## =========================
+# We'll sweep train_frac in {0.3, 0.5, 0.7} and compute:
+#  - Calibration under the null: Pr(p<0.05) and KS distance to Uniform(0,1)
+#  - Power at a few deltas: Pr(p<0.05)
+
+library(stats)
+ks_to_uniform <- function(p) {
+  p <- sort(p[is.finite(p)])
+  if (length(p) < 10) return(NA_real_)
+  u <- (seq_along(p) - 0.5) / length(p)
+  max(abs(p - u))  # one-sample KS distance to U(0,1)
+}
+
+train_fracs <- c(0.3, 0.5, 0.7)
+deltas_pow  <- c(0.2, 0.3, 0.4)   # effect sizes for power curves
+R_null <- 600
+R_pow  <- 400
+
+## --- A) NULL calibration across split fractions ---
+calib_rows <- lapply(train_fracs, function(tf) {
+  df <- exp1_run(function(i) worker_cluster_ttest(i, X = X, y = y_null, train_frac = tf),
+                 R = R_null, seed = 100 + round(100*tf))
+  data.frame(train_frac = tf,
+             type1_at_005 = mean(df$p_se1 < 0.05, na.rm = TRUE),
+             ks = ks_to_uniform(df$p_se1))
+})
+calib_df <- do.call(rbind, calib_rows)
+print(calib_df)
+
+## --- B) Power vs split fraction for a few deltas ---
+pow_rows <- lapply(deltas_pow, function(d) {
+  do.call(rbind, lapply(train_fracs, function(tf) {
+    df <- exp1_run(function(i) worker_cluster_ttest_with_delta(i, X = X, y = y_null,
+                                                               delta = d, train_frac = tf),
+                   R = R_pow, seed = 200 + round(1000*d) + round(100*tf))
+    data.frame(delta = d, train_frac = tf,
+               power = mean(df$p_se1 < 0.05, na.rm = TRUE))
+  }))
+})
+power_tf_df <- do.call(rbind, pow_rows)
+print(power_tf_df)
+
+## --- Plots: calibration + power-by-fraction ---
+library(ggplot2)
+
+# Type I error and KS vs train_frac
+p_type1 <- ggplot(calib_df, aes(train_frac, type1_at_005)) +
+  geom_line() + geom_point() +
+  geom_hline(yintercept = 0.05, linetype = 2) +
+  labs(x = "Training fraction", y = "Type I error (α=0.05)",
+       title = "Calibration across train/test split")
+
+p_ks <- ggplot(calib_df, aes(train_frac, ks)) +
+  geom_line() + geom_point() +
+  labs(x = "Training fraction", y = "KS distance to Uniform(0,1)",
+       title = "Deviation from uniform under the null")
+
+# Power vs train_frac, one curve per delta
+p_pow <- ggplot(power_tf_df, aes(train_frac, power, group = factor(delta), shape = factor(delta))) +
+  geom_line(aes(linetype = factor(delta))) + geom_point() +
+  scale_y_continuous(limits = c(0,1)) +
+  labs(x = "Training fraction", y = "Power (Pr(p<0.05))",
+       shape = "delta", linetype = "delta",
+       title = "Power vs. train/test split")
+
+print(p_type1); print(p_ks); print(p_pow)
+
+## --- C) Naïve (incorrect) full-data reuse for contrast ---
+# Cluster on ALL data, then (incorrectly) test on the SAME data.
+worker_naive_fullreuse <- function(i, X, y, k = 2, nstart = 10) {
+  km <- stats::kmeans(X, centers = k, nstart = nstart)     # uses all data
+  g  <- assign_to_two(X, km$centers)                       # assign same data
+  y1 <- y[g == 1L]; y2 <- y[g == 2L]
+  y1 <- y1[is.finite(y1)]; y2 <- y2[is.finite(y2)]
+  if (length(y1) < 2L || length(y2) < 2L) stop("too_few_obs")
+  stats::t.test(y1, y2, var.equal = FALSE)$p.value         # anti-conservative under null
+}
+
+naive_df <- exp1_run(function(i) worker_naive_fullreuse(i, X = X, y = y_null),
+                     R = 600, seed = 999)
+naive_type1 <- mean(naive_df$p_se1 < 0.05, na.rm = TRUE)
+naive_ks    <- ks_to_uniform(naive_df$p_se1)
+cat(sprintf("Naïve full-reuse null: Pr(p<0.05)=%.3f, KS=%.3f\n", naive_type1, naive_ks))
+
+p_naive_hist <- ggplot(naive_df, aes(p_se1)) +
+  geom_histogram(bins = 20, boundary = 0) +
+  coord_cartesian(xlim = c(0,1)) +
+  labs(x = "p-value", y = "Count", title = "Naïve full-data reuse: p-value histogram (null)")
+print(p_naive_hist)
