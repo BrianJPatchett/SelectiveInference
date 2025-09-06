@@ -1,0 +1,45 @@
+# Pseudocode for a single-stage selective inference experiment
+run_single_stage_experiment <- function(cfg) {
+  # cfg is a list with entries like: n, p, R, method, delta, seed
+  
+  set.seed(cfg$seed)  # reproducibility
+  
+  # storage for results
+  results <- vector("list", cfg$R)
+  
+  for (r in 1:cfg$R) {
+    # 1. Generate data under null or alternative
+    X <- simulate_data(n = cfg$n, p = cfg$p, delta = cfg$delta)
+    
+    # 2. Apply clustering / selection procedure
+    clusters <- cluster_method(X, method = cfg$method)
+    
+    # 3. Run test (naive, split, multi-split, CADET)
+    pval <- selective_test(X, clusters, method = cfg$method)
+    
+    results[[r]] <- list(pval = pval)
+  }
+  
+  # Tidy results
+  df <- bind_rows(results)
+  
+  # Unit checks
+  ks_stat <- ks.test(df$pval, "punif")$statistic
+  naive_type1 <- mean(df$pval < 0.05)
+  
+  # Timing/memory profiling (wrap around the whole loop in real code)
+  # Example: bench::mark or system.time
+  
+  # Return results + diagnostic plot
+  fig <- ggplot(df, aes(pval)) +
+    geom_histogram(bins = 30) +
+    geom_hline(yintercept = cfg$R / 30, linetype = "dashed") +
+    labs(title = paste("P-value histogram:", cfg$method))
+  
+  return(list(summary = df,
+              ks_stat = ks_stat,
+              naive_type1 = naive_type1,
+              fig = fig,
+              config = cfg,
+              session = sessionInfo()))
+}
