@@ -1,0 +1,28 @@
+# ---- CI via CADET (if available for the selected procedure) ----
+ci_via_cadet <- function(X, clusters, alpha = 0.05, target = c("mean_diff")) {
+  # X: data matrix
+  # clusters: selection output (cluster labels, centroids, etc.)
+  # alpha: nominal level
+  # returns: list(lo, hi, method = "cadet", meta = list(...))
+  
+  # 1) Construct the test target from `X` + `clusters`
+  # e.g., the contrast vector c' * mu for "mean difference between two selected clusters"
+  target_spec <- build_target_spec(X, clusters, target = target)
+  
+  # 2) Ask CADET for a selective CI (many CADET functions return a TG-interval directly)
+  cadet_out <- CADET::selective_ci(
+    X = X,
+    selection = clusters,
+    target = target_spec,
+    alpha = alpha
+  )
+  
+  # Assume cadet_out gives lo, hi (or similar); adapt names if needed
+  out <- list(
+    lo = cadet_out$ci_lower,
+    hi = cadet_out$ci_upper,
+    method = "cadet",
+    meta = list(target = target, alpha = alpha)
+  )
+  return(out)
+}
